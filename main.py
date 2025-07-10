@@ -2,16 +2,15 @@ import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime
-from telegram import Bot
+import datetime
+import ta
+from telegram.ext import Updater, CommandHandler
 
-# Load Polygon and Telegram keys from environment
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# === CONFIG ===
+API_KEY = os.getenv("POLYGON_API_KEY")  # Set in environment or .env file
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# Define all symbols (Polygon format)
-symbols = {
+SYMBOLS = {
     "C:EURUSD": "EUR/USD",
     "C:GBPUSD": "GBP/USD",
     "C:USDJPY": "USD/JPY",
@@ -20,72 +19,119 @@ symbols = {
     "C:AUDUSD": "AUD/USD",
     "C:NZDUSD": "NZD/USD",
     "X:BTCUSD": "BTC/USD",
-    "X:ETHUSD": "ETH/USD",
-    "X:XAUUSD": "XAU/USD",   # Gold
-    "X:XAGUSD": "XAG/USD"    # Silver
+    "X:XAUUSD": "XAU/USD",
+    "X:XAGUSD": "XAG/USD"
 }
 
-def fetch_polygon_data(ticker, limit=50):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/15/minute/2024-07-01/{datetime.utcnow().date()}?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        data = res.json()
-        if "results" not in data:
-            return None
-        df = pd.DataFrame(data["results"])
-        df["t"] = pd.to_datetime(df["t"], unit="ms")
-        df = df.rename(columns={
-            "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"
-        })
-        return df[["t", "Open", "High", "Low", "Close", "Volume"]].iloc[::-1]
-    except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
+# === DATA FETCH ===
+def fetch_data(symbol, interval="15", limit=100):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{interval}/minute/2024-01-01/{datetime.datetime.now().strftime('%Y-%m-%d')}?adjusted=true&limit={limit}&sort=desc&apiKey={API_KEY}"
+    r = requests.get(url)
+    r.raise_for_status()
+    data = r.json()
+    if "results" not in data:
         return None
+    df = pd.DataFrame(data["results"])
+    df = df.iloc[::-1].reset_index(drop=True)
+    df["t"] = pd.to_datetime(df["t"], unit="ms")
+    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+    df = df[["t", "Open", "High", "Low", "Close", "Volume"]]
+    return df
 
-def detect_double_bottom(df):
-    if len(df) < 4: return False
-    lows = df['Low']
-    return (lows.iloc[-2] > lows.iloc[-3] and
-            abs(lows.iloc[-1] - lows.iloc[-3]) / lows.iloc[-3] < 0.005)
+# === INDICATORS ===
+def add_indicators(df):
+    bb = ta.volatility.BollingerBands(df['Close'], window=20)
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+    return df
 
-def detect_double_top(df):
-    if len(df) < 4: return False
-    highs = df['High']
-    return (highs.iloc[-2] < highs.iloc[-3] and
-            abs(highs.iloc[-1] - highs.iloc[-3]) / highs.iloc[-3] < 0.005)
+# === PATTERN DETECTION ===
+def detect_bearish_engulfing(df):
+    if len(df) < 2:
+        return False
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    return (
+        prev["Close"] > prev["Open"] and
+        curr["Close"] < curr["Open"] and
+        curr["Open"] > prev["Close"] and
+        curr["Close"] < prev["Open"]
+    )
 
-def send_telegram_alert(message):
+def detect_bullish_engulfing(df):
+    if len(df) < 2:
+        return False
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    return (
+        prev["Close"] < prev["Open"] and
+        curr["Close"] > curr["Open"] and
+        curr["Open"] < prev["Close"] and
+        curr["Close"] > prev["Open"]
+    )
+
+def is_bearish_engulfing_at_upper_bb(df):
+    if detect_bearish_engulfing(df):
+        curr = df.iloc[-1]
+        return curr["Close"] >= curr["bb_upper"] * 0.98
+    return False
+
+def is_bullish_engulfing_at_lower_bb(df):
+    if detect_bullish_engulfing(df):
+        curr = df.iloc[-1]
+        return curr["Close"] <= curr["bb_lower"] * 1.02
+    return False
+
+# === ALERT ===
+def send_alert(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
     try:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML")
-        print("✅ Alert sent!")
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
+        print("Failed to send alert:", e)
 
-def scan_all():
-    for symbol, name in symbols.items():
-        df = fetch_polygon_data(symbol)
-        if df is None or df.empty:
-            continue
-        alerts = []
-        if detect_double_bottom(df):
-            alerts.append("🟢 Double Bottom")
-        if detect_double_top(df):
-            alerts.append("🔴 Double Top")
-        if alerts:
-            latest = df.iloc[-1]
-            msg = (
-                f"<b>{name} ({symbol})</b>\n"
-                f"🕒 {latest['t'].strftime('%Y-%m-%d %H:%M')}\n"
-                f"💰 Price: {latest['Close']:.4f}\n"
-                + "\n".join(alerts)
-                + "\n\n📌 Sans D Fx Trader"
-            )
-            send_telegram_alert(msg)
+# === ANALYSIS ===
+def analyze():
+    for symbol, name in SYMBOLS.items():
+        try:
+            df = fetch_data(symbol)
+            if df is None or len(df) < 30:
+                continue
+            df = add_indicators(df)
+
+            msg_lines = []
+            if is_bullish_engulfing_at_lower_bb(df):
+                msg_lines.append(f"🟢 <b>Bullish Engulfing</b> at Lower BB on {name}")
+            if is_bearish_engulfing_at_upper_bb(df):
+                msg_lines.append(f"🔴 <b>Bearish Engulfing</b> at Upper BB on {name}")
+
+            if msg_lines:
+                current_price = df["Close"].iloc[-1]
+                time_now = df["t"].iloc[-1].strftime("%Y-%m-%d %H:%M")
+                message = f"<b>📡 Pattern Alert</b>\nSymbol: <b>{name}</b>\nPrice: {current_price:.4f}\nTime: {time_now} IST\n" + "\n".join(msg_lines) + "\n\n📌 Sans D Fx Trader"
+                send_alert(message)
+        except Exception as e:
+            print(f"Error analyzing {name}: {e}")
+
+# === TELEGRAM BOT ===
+def start(update, context):
+    update.message.reply_text("✅ Screener Bot is Online.\nUse /scan to scan the market.")
+
+def scan(update, context):
+    update.message.reply_text("🔍 Scanning Market Now...")
+    analyze()
+    update.message.reply_text("✅ Scan Complete.")
+
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("scan", scan))
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    print("🚀 Screener Started (15m TF, Polygon Data)...")
-    while True:
-        scan_all()
-        time.sleep(900)  # 15 minutes
+    main()
