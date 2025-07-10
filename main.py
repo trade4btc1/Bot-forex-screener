@@ -4,12 +4,13 @@ import requests
 import pandas as pd
 import datetime
 import ta
-from telegram.ext import Updater, CommandHandler
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# === CONFIG ===
-API_KEY = os.getenv("POLYGON_API_KEY")  # Set in environment or .env file
+API_KEY = os.getenv("POLYGON_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
 SYMBOLS = {
     "C:EURUSD": "EUR/USD",
     "C:GBPUSD": "GBP/USD",
@@ -23,7 +24,6 @@ SYMBOLS = {
     "X:XAGUSD": "XAG/USD"
 }
 
-# === DATA FETCH ===
 def fetch_data(symbol, interval="15", limit=100):
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{interval}/minute/2024-01-01/{datetime.datetime.now().strftime('%Y-%m-%d')}?adjusted=true&limit={limit}&sort=desc&apiKey={API_KEY}"
     r = requests.get(url)
@@ -35,20 +35,15 @@ def fetch_data(symbol, interval="15", limit=100):
     df = df.iloc[::-1].reset_index(drop=True)
     df["t"] = pd.to_datetime(df["t"], unit="ms")
     df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-    df = df[["t", "Open", "High", "Low", "Close", "Volume"]]
-    return df
+    return df[["t", "Open", "High", "Low", "Close", "Volume"]]
 
-# === INDICATORS ===
 def add_indicators(df):
     bb = ta.volatility.BollingerBands(df['Close'], window=20)
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
     return df
 
-# === PATTERN DETECTION ===
 def detect_bearish_engulfing(df):
-    if len(df) < 2:
-        return False
     prev, curr = df.iloc[-2], df.iloc[-1]
     return (
         prev["Close"] > prev["Open"] and
@@ -58,8 +53,6 @@ def detect_bearish_engulfing(df):
     )
 
 def detect_bullish_engulfing(df):
-    if len(df) < 2:
-        return False
     prev, curr = df.iloc[-2], df.iloc[-1]
     return (
         prev["Close"] < prev["Open"] and
@@ -70,17 +63,14 @@ def detect_bullish_engulfing(df):
 
 def is_bearish_engulfing_at_upper_bb(df):
     if detect_bearish_engulfing(df):
-        curr = df.iloc[-1]
-        return curr["Close"] >= curr["bb_upper"] * 0.98
+        return df.iloc[-1]["Close"] >= df.iloc[-1]["bb_upper"] * 0.98
     return False
 
 def is_bullish_engulfing_at_lower_bb(df):
     if detect_bullish_engulfing(df):
-        curr = df.iloc[-1]
-        return curr["Close"] <= curr["bb_lower"] * 1.02
+        return df.iloc[-1]["Close"] <= df.iloc[-1]["bb_lower"] * 1.02
     return False
 
-# === ALERT ===
 def send_alert(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -91,9 +81,8 @@ def send_alert(message):
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print("Failed to send alert:", e)
+        print("Telegram alert failed:", e)
 
-# === ANALYSIS ===
 def analyze():
     for symbol, name in SYMBOLS.items():
         try:
@@ -102,36 +91,38 @@ def analyze():
                 continue
             df = add_indicators(df)
 
-            msg_lines = []
+            alerts = []
             if is_bullish_engulfing_at_lower_bb(df):
-                msg_lines.append(f"🟢 <b>Bullish Engulfing</b> at Lower BB on {name}")
+                alerts.append(f"🟢 <b>Bullish Engulfing</b> at Lower BB on {name}")
             if is_bearish_engulfing_at_upper_bb(df):
-                msg_lines.append(f"🔴 <b>Bearish Engulfing</b> at Upper BB on {name}")
+                alerts.append(f"🔴 <b>Bearish Engulfing</b> at Upper BB on {name}")
 
-            if msg_lines:
-                current_price = df["Close"].iloc[-1]
-                time_now = df["t"].iloc[-1].strftime("%Y-%m-%d %H:%M")
-                message = f"<b>📡 Pattern Alert</b>\nSymbol: <b>{name}</b>\nPrice: {current_price:.4f}\nTime: {time_now} IST\n" + "\n".join(msg_lines) + "\n\n📌 Sans D Fx Trader"
+            if alerts:
+                price = df.iloc[-1]["Close"]
+                time_ist = df.iloc[-1]["t"] + datetime.timedelta(hours=5, minutes=30)
+                time_str = time_ist.strftime("%Y-%m-%d %H:%M")
+                message = f"<b>📡 Pattern Alert</b>\nSymbol: <b>{name}</b>\nPrice: {price:.4f}\nTime: {time_str} IST\n" + "\n".join(alerts) + "\n\n📌 Sans D Fx Trader"
                 send_alert(message)
+
         except Exception as e:
-            print(f"Error analyzing {name}: {e}")
+            print(f"Error scanning {name}: {e}")
 
-# === TELEGRAM BOT ===
-def start(update, context):
-    update.message.reply_text("✅ Screener Bot is Online.\nUse /scan to scan the market.")
+# === Bot Commands ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Screener Bot is Online. Use /scan to scan the market.")
 
-def scan(update, context):
-    update.message.reply_text("🔍 Scanning Market Now...")
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Scanning Market Now...")
     analyze()
-    update.message.reply_text("✅ Scan Complete.")
+    await update.message.reply_text("✅ Scan Complete.")
 
-def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("scan", scan))
-    updater.start_polling()
-    updater.idle()
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan))
+    print("🚀 Bot is running...")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
