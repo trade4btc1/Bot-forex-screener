@@ -64,4 +64,4 @@ def run_screener():
             latest = df.iloc[-1]
             price = latest['Close']
             time = latest['t']
-            print(f"{pattern} detected on {name} at {price:.2f} ({time})")
+print(f"{pattern} detected on {name} at {price:.2f} ({time})\n📌 Sans D Fx Trader")
