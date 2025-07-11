@@ -9,8 +9,9 @@ def start(update, context):
     update.message.reply_text("🚀 Forex Screener Bot is Live. Use /scan to manually scan.")
 
 def scan(update, context):
-    update.message.reply_text("🔍 Running manual scan now...")
+    update.message.reply_text("🔍 Running manual scan now...\n📌 Sans D Fx Trader")
     run_screener()
+
 
 def main():
     keep_alive()
