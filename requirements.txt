@@ -1,6 +1,8 @@
-pandas
-requests
+flask
 python-telegram-bot
+pandas
+numpy
+requests
 schedule
 python-dotenv
 ta
